@@ -863,6 +863,50 @@ class Archiver:
         cache.commit()
         return self.exit_code
 
+    @with_repository(cache=True, exclusive=True)
+    def do_clone(self, args, repository, manifest, key, cache):
+        """Clone archives"""
+        def interrupt(signal_num, stack_frame):
+            if recreater.interrupt:
+                print("\nReceived signal, again. I'm not deaf.", file=sys.stderr)
+            else:
+                print("\nReceived signal, will exit cleanly.", file=sys.stderr)
+            recreater.interrupt = True
+
+
+        matcher, include_patterns = self.build_matcher(args.excludes + changed, args.paths)
+        self.output_list = args.output_list
+        self.output_filter = args.output_filter
+
+        recreater = ArchiveRecreater(repository, manifest, key, cache, matcher,
+                                     exclude_caches=args.exclude_caches, exclude_if_present=args.exclude_if_present,
+                                     keep_tag_files=args.keep_tag_files,
+                                     progress=args.progress, stats=args.stats,
+                                     file_status_printer=self.print_file_status,
+                                     dry_run=args.dry_run, target_name=args.target_name)
+
+        signal.signal(signal.SIGTERM, interrupt)
+        signal.signal(signal.SIGINT, interrupt)
+
+        if args.location.archive:
+            name = args.location.archive
+            if recreater.is_temporary_archive(name):
+                self.print_error('Refusing to work on temporary archive of prior recreate: %s', name)
+                return self.exit_code
+            recreater.recreate(name, args.comment)
+        else:
+            for archive in manifest.list_archive_infos(sort_by='ts'):
+                name = archive.name
+                if recreater.is_temporary_archive(name):
+                    continue
+                print('Processing', name)
+                if not recreater.recreate(name, args.comment):
+                    break
+        manifest.write()
+        repository.commit()
+        cache.commit()
+        return self.exit_code
+
     @with_repository()
     def do_debug_dump_archive_items(self, args, repository, manifest, key):
         """dump (decrypted, decompressed) archive items metadata (not: data)"""
@@ -1294,6 +1338,7 @@ class Archiver:
 
         archive_group = subparser.add_argument_group('Archive options')
         archive_group.add_argument('--comment', dest='comment', metavar='COMMENT', default='',
+                                   type=str,
                                    help='add a comment text to the archive')
         archive_group.add_argument('--timestamp', dest='timestamp',
                                    type=timestamp, default=None,
@@ -1774,6 +1819,107 @@ class Archiver:
                                help='repository/archive to recreate')
         subparser.add_argument('paths', metavar='PATH', nargs='*', type=str,
                                help='paths to recreate; patterns are supported')
+
+        subparser = subparsers.add_parser('help', parents=[common_parser], add_help=False,
+                                          description='Extra help')
+        subparser.add_argument('--epilog-only', dest='epilog_only',
+                               action='store_true', default=False)
+        subparser.add_argument('--usage-only', dest='usage_only',
+                               action='store_true', default=False)
+        subparser.set_defaults(func=functools.partial(self.do_help, parser, subparsers.choices))
+        subparser.add_argument('topic', metavar='TOPIC', type=str, nargs='?',
+                               help='additional help on TOPIC')
+
+        clone_epilog = textwrap.dedent("""
+        Clone existing archive into another one
+
+        --exclude, --exclude-from and PATH have the exact same semantics
+        as in "borg create". If PATHs are specified the resulting archive
+        will only contain files from these PATHs.
+
+        --compression: all new chunks processed will be stored using the
+        given method.
+
+        borg clone is signal safe. Send either SIGINT (Ctrl-C on most terminals) or
+        SIGTERM to request termination.
+
+        Use the *exact same* command line to resume the operation later - changing excludes
+        or paths will lead to inconsistencies (changed excludes will only apply to newly
+        processed files/dirs).
+        """)
+        subparser = subparsers.add_parser('clone', parents=[common_parser], add_help=False,
+                                          description=self.do_clone.__doc__,
+                                          epilog=clone_epilog,
+                                          formatter_class=argparse.RawDescriptionHelpFormatter,
+                                          help=self.do_clone.__doc__)
+        subparser.set_defaults(func=self.do_clone)
+        subparser.add_argument('--list', dest='output_list',
+                               action='store_true', default=False,
+                               help='output verbose list of items (files, dirs, ...)')
+        subparser.add_argument('--filter', dest='output_filter', metavar='STATUSCHARS',
+                               help='only display items with the given status characters')
+        subparser.add_argument('-p', '--progress', dest='progress',
+                               action='store_true', default=False,
+                               help='show progress display while recreating archives')
+        subparser.add_argument('-n', '--dry-run', dest='dry_run',
+                               action='store_true', default=False,
+                               help='do not change anything')
+        subparser.add_argument('-s', '--stats', dest='stats',
+                               action='store_true', default=False,
+                               help='print statistics at end')
+
+        exclude_group = subparser.add_argument_group('Exclusion options')
+        exclude_group.add_argument('-e', '--exclude', dest='excludes',
+                                   type=parse_pattern, action='append',
+                                   metavar="PATTERN", help='exclude paths matching PATTERN')
+        exclude_group.add_argument('--exclude-from', dest='exclude_files',
+                                   type=argparse.FileType('r'), action='append',
+                                   metavar='EXCLUDEFILE', help='read exclude patterns from EXCLUDEFILE, one per line')
+        exclude_group.add_argument('--exclude-caches', dest='exclude_caches',
+                                   action='store_true', default=False,
+                                   help='exclude directories that contain a CACHEDIR.TAG file ('
+                                        'http://www.brynosaurus.com/cachedir/spec.html)')
+        exclude_group.add_argument('--exclude-if-present', dest='exclude_if_present',
+                                   metavar='FILENAME', action='append', type=str,
+                                   help='exclude directories that contain the specified file')
+        exclude_group.add_argument('--keep-tag-files', dest='keep_tag_files',
+                                   action='store_true', default=False,
+                                   help='keep tag files of excluded caches/directories')
+
+        archive_group = subparser.add_argument_group('Archive options')
+        archive_group.add_argument('--new_name', dest='target_name', metavar='NEWNAME',
+                                   type=archivename_validator(), default='',
+                                   help='Name of clone archive')
+        archive_group.add_argument('--changed-files', dest='changed_files',
+                                   type=argparse.FileType('r'), action='append',
+                                   metavar='CHANGEDFILE', help='read list of files to replace in the archive from EXCLUDEFILE, one per line')
+        archive_group.add_argument('--comment', dest='comment', metavar='COMMENT',
+                                   default=None,
+                                   help='add a comment text to the archive')
+        archive_group.add_argument('--timestamp', dest='timestamp',
+                                   type=timestamp, default=None,
+                                   metavar='yyyy-mm-ddThh:mm:ss',
+                                   help='manually specify the archive creation date/time (UTC). '
+                                        'alternatively, give a reference file/directory.')
+        archive_group.add_argument('-C', '--compression', dest='compression',
+                                   type=CompressionSpec, default=None, metavar='COMPRESSION',
+                                   help='select compression algorithm (and level):\n'
+                                        'none == no compression (default),\n'
+                                        'lz4 == lz4,\n'
+                                        'zlib == zlib (default level 6),\n'
+                                        'zlib,0 .. zlib,9 == zlib (with level 0..9),\n'
+                                        'lzma == lzma (default level 6),\n'
+                                        'lzma,0 .. lzma,9 == lzma (with level 0..9).')
+        archive_group.add_argument('--chunker-params', dest='chunker_params',
+                                   type=ChunkerParams, default=None,
+                                   metavar='CHUNK_MIN_EXP,CHUNK_MAX_EXP,HASH_MASK_BITS,HASH_WINDOW_SIZE',
+                                   help='specify the chunker parameters (or "default").')
+
+        subparser.add_argument('location', metavar='REPOSITORY_OR_ARCHIVE', nargs='?', default='',
+                               type=location_validator(),
+                               help='repository/archive to clone')
+        subparser.add_argument('paths', metavar='PATH', nargs='*', type=str,
+                               help='paths to clone; patterns are supported')
 
         subparser = subparsers.add_parser('help', parents=[common_parser], add_help=False,
                                           description='Extra help')

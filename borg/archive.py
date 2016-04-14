@@ -949,12 +949,14 @@ class ArchiveRecreater:
     def __init__(self, repository, manifest, key, cache, matcher,
                  exclude_caches=False, exclude_if_present=None, keep_tag_files=False,
                  chunker_params=None, compression=None,
-                 dry_run=False, stats=False, progress=False, file_status_printer=None):
+                 dry_run=False, stats=False, progress=False, file_status_printer=None,
+                 target_name=''):
         self.repository = repository
         self.key = key
         self.manifest = manifest
         self.cache = cache
 
+        self.target_name = target_name
         self.matcher = matcher
         self.exclude_caches = exclude_caches
         self.exclude_if_present = exclude_if_present or []
@@ -985,7 +987,7 @@ class ArchiveRecreater:
         target, resume_from = self.create_target_or_resume(archive)
         if self.exclude_if_present or self.exclude_caches:
             self.matcher_add_tagged_dirs(archive)
-        if self.matcher.empty() and not self.recompress and not target.recreate_rechunkify and comment is None:
+        if self.matcher.empty() and not self.recompress and not target.recreate_rechunkify and comment is None and self.target_name is '':
             logger.info("Skipping archive %s, nothing to do", archive_name)
             return True
         try:
@@ -1121,8 +1123,11 @@ class ArchiveRecreater:
                 'cmdline': archive.metadata[b'cmdline'],
                 'recreate_cmdline': sys.argv,
             })
-            archive.delete(Statistics(), progress=self.progress)
-            target.rename(archive.name)
+            if self.target_name:
+                target.rename(self.target_name)
+            else:
+                archive.delete(Statistics(), progress=self.progress)
+                target.rename(archive.name)
             if self.stats:
                 target.end = datetime.utcnow()
                 log_multi(DASHES,
@@ -1137,7 +1142,7 @@ class ArchiveRecreater:
                 'recreate_source_id': archive.id,
                 'recreate_args': sys.argv[1:],
             })
-            target.save(name=archive.name + '.recreate', additional_metadata=additional_metadata)
+            target.save(additional_metadata=additional_metadata)
             logger.info('Run the same command again to resume.')
         return completed
 
@@ -1179,7 +1184,10 @@ class ArchiveRecreater:
         """Create new target archive or resume from temporary archive, if it exists. Return archive, resume from path"""
         if self.dry_run:
             return self.FakeTargetArchive(), None
-        target_name = archive.name + '.recreate'
+        if self.target_name:
+            target_name = self.target_name + '.recreate'
+        else:
+            target_name = archive.name + '.recreate'
         resume = target_name in self.manifest.archives
         target, resume_from = None, None
         if resume:
